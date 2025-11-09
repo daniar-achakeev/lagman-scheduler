@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package task.v1;
+
+option go_package = "go/;taskpb";
+
+// think later about security and authentication
+message Task {
+    string id = 1;
+    string schduler_id = 2; 
+    string callback_ip = 3;
+    int32 callback_port = 4; 
+    string payload = 5;
+    int32 deadline = 6;
+}
+// currently simple result
+message Result {
+    string job_id = 1;
+    string task_id = 2;
+    int32 result = 3;
+}

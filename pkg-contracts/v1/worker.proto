@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package worker.v1;
+
+option go_package = "go/;taskpb";
+
+import "task.proto";
+
+service Tasks {
+    rpc SubmitTask(SubmitTaskRequest) returns (SubmitTaskResponse);
+}
+
+message SubmitTaskRequest {
+    task.v1.Task job = 1;
+}
+
+message SubmitTaskResponse {
+    bool success = 1;
+}
