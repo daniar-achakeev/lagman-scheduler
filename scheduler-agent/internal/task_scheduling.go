@@ -5,16 +5,102 @@ import (
 	"fmt"
 )
 
-type JobGraph struct {
-	Id    string
-	roots []*Task
+type InEdge struct {
+	proceedOnSuceess bool
+	sinkId           string
 }
 
-func NewJobGraph(id string, roots []*Task) *JobGraph {
+type JobGraph struct {
+	id       string
+	nodes    map[string]Runnable
+	inEdges  map[string][]InEdge
+	outEdges map[string][]string
+}
+
+func NewJobGraph(id string) *JobGraph {
 	return &JobGraph{
-		Id:    id,
-		roots: roots,
+		id:       id,
+		nodes:    map[string]Runnable{},
+		outEdges: map[string][]string{}, // from source to list of sinks
+		inEdges:  map[string][]InEdge{}, // reverse edges needed for dependecies
 	}
+}
+
+func (j *JobGraph) Add(taskId string, runnable Runnable) {
+	j.nodes[taskId] = runnable
+}
+
+func (j *JobGraph) AddDependsOn(sourceId string, sinkId string, proceedOnSuccess bool) error {
+	if _, ok := j.nodes[sourceId]; !ok {
+		return fmt.Errorf("sourceId %s not found", sourceId)
+	}
+	if _, ok := j.nodes[sinkId]; !ok {
+		return fmt.Errorf("sinkId %s not found", sinkId)
+	}
+	_, ok := j.inEdges[sinkId]
+	if !ok {
+		j.inEdges[sinkId] = make([]InEdge, 0)
+	}
+	j.inEdges[sinkId] = append(j.inEdges[sinkId], InEdge{sinkId: sourceId, proceedOnSuceess: proceedOnSuccess})
+	_, ok = j.outEdges[sourceId]
+	if !ok {
+		j.outEdges[sourceId] = make([]string, 0)
+	}
+	j.outEdges[sourceId] = append(j.outEdges[sourceId], sinkId)
+	return nil
+}
+
+func (j *JobGraph) GetTopologicalOrder() ([]string, error) {
+	tOrderedNodes := make([]string, 0, len(j.nodes))
+	// copy the graph
+	graphOutCopy := map[string]map[string]struct{}{}
+	graphInCopy := map[string]map[string]struct{}{}
+	for k, v := range j.outEdges {
+		m := map[string]struct{}{}
+		for _, n := range v {
+			m[n] = struct{}{}
+		}
+		graphOutCopy[k] = m
+	}
+	for k, v := range j.inEdges {
+		m := map[string]struct{}{}
+		for _, n := range v {
+			m[n.sinkId] = struct{}{}
+		}
+		graphInCopy[k] = m
+	}
+	// find roots
+	roots := map[string]struct{}{}
+	for c := range j.nodes {
+		if _, ok := j.inEdges[c]; !ok {
+			roots[c] = struct{}{}
+		}
+	}
+	for len(roots) > 0 {
+		for c := range roots {
+			// remove from roots reflected after loop end
+			delete(roots, c)
+			tOrderedNodes = append(tOrderedNodes, c)
+			// expand
+			childNodes, ok := graphOutCopy[c]
+			if ok {
+				delete(graphOutCopy, c)
+				for ch := range childNodes {
+					// remove reverse edge too
+					delete(graphInCopy[ch], c)
+					inEdges, ok := graphInCopy[ch]
+					if ok && len(inEdges) == 0 { // no in egdes
+						delete(graphInCopy, ch)
+						roots[ch] = struct{}{}
+					}
+				}
+			}
+		}
+	}
+	if len(graphOutCopy) > 0 {
+		return nil, fmt.Errorf("graph has at least one cycle")
+	}
+	return tOrderedNodes, nil
 }
 
 // TaskIdSet

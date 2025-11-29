@@ -2,6 +2,7 @@ package internal
 
 import (
 	"context"
+	"slices"
 	"testing"
 )
 
@@ -42,4 +43,85 @@ forLoop:
 		}
 	}
 	t.Logf("All results \n %v", results)
+}
+
+func TestJobGraphSortCycle(t *testing.T) {
+	job := NewJobGraph("GraphCycle")
+	job.Add("A", &LocalBashRunnable{Command: "echo A && sleep 1"})
+	job.Add("B", &LocalBashRunnable{Command: "echo B && sleep 1"})
+	job.Add("C", &LocalBashRunnable{Command: "echo C && sleep 1"})
+	job.Add("P", &LocalBashRunnable{Command: "echo P && sleep 1"})
+	job.Add("D", &LocalBashRunnable{Command: "echo D && sleep 1"})
+	job.Add("W", &LocalBashRunnable{Command: "echo W && sleep 1"})
+	err := job.AddDependsOn("A", "D", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = job.AddDependsOn("B", "D", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = job.AddDependsOn("C", "P", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = job.AddDependsOn("P", "W", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = job.AddDependsOn("D", "W", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// cycle
+	err = job.AddDependsOn("W", "D", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = job.GetTopologicalOrder()
+	if err == nil {
+		t.Fatalf("there is a cycle in a graph %v", err)
+	}
+}
+
+func TestJobGraphSort(t *testing.T) {
+	job := NewJobGraph("GraphCycle")
+	job.Add("A", &LocalBashRunnable{Command: "echo A && sleep 1"})
+	job.Add("B", &LocalBashRunnable{Command: "echo B && sleep 1"})
+	job.Add("C", &LocalBashRunnable{Command: "echo C && sleep 1"})
+	job.Add("P", &LocalBashRunnable{Command: "echo P && sleep 1"})
+	job.Add("D", &LocalBashRunnable{Command: "echo D && sleep 1"})
+	job.Add("W", &LocalBashRunnable{Command: "echo W && sleep 1"})
+	err := job.AddDependsOn("A", "D", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = job.AddDependsOn("B", "D", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = job.AddDependsOn("C", "P", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = job.AddDependsOn("P", "W", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = job.AddDependsOn("D", "W", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orderedSeq, err := job.GetTopologicalOrder()
+	t.Log(orderedSeq)
+	if err != nil {
+		t.Fatalf("there is a cycle in a graph but it should not %v", err)
+	}
+	expected := []string{"A", "B", "C", "D", "P", "W"}
+	for _, e := range expected {
+		ok := slices.Contains(orderedSeq, e)
+		if !ok {
+			t.Fatalf("node %s not in sequence", e)
+		}
+	}
 }
