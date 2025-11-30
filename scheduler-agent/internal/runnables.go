@@ -19,16 +19,9 @@ const (
 // Runnable context aware could be canceld due to timeouts or errors
 type Runnable interface {
 	Run(ctx context.Context, taskId string) Result
-}
-
-type Result struct {
-	TaskId     string
-	ReturnCode int
-	Err        error
-	Duration   time.Duration
-	FinishedAt time.Time
-	Stdout     string // currently stores 1000 chars
-	Stderr     string // currently stores 1000 chars
+	DryRun(ctx context.Context, taskId string) bool
+	// TODO Serialize to byte slice
+	// TODO Deserialize from byte slice
 }
 
 // HeadWriter is used for stdtout and stderr
@@ -62,7 +55,19 @@ func (hw *HeadWriter) String() string {
 }
 
 type LocalBashRunnable struct {
-	Command string
+	Command          string
+	maxCharStdOutErr int
+}
+
+func NewLocalBashRunnable(command string, maxCharStdOutErr int) *LocalBashRunnable {
+	return &LocalBashRunnable{
+		Command:          command,
+		maxCharStdOutErr: maxCharStdOutErr,
+	}
+}
+
+func (l *LocalBashRunnable) DryRun(ctx context.Context, taskId string) bool {
+	return true
 }
 
 func (l *LocalBashRunnable) Run(ctx context.Context, taskId string) Result {
@@ -79,8 +84,8 @@ func (l *LocalBashRunnable) Run(ctx context.Context, taskId string) Result {
 	var stdout, stderr HeadWriter
 	// TODO where to store stdout and stderr
 	// where to log and so on
-	stdout = *NewHeadWriter(1000)
-	stderr = *NewHeadWriter(1000)
+	stdout = *NewHeadWriter(l.maxCharStdOutErr)
+	stderr = *NewHeadWriter(l.maxCharStdOutErr)
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	result := Result{}
@@ -107,7 +112,7 @@ func (l *LocalBashRunnable) Run(ctx context.Context, taskId string) Result {
 		result.ReturnCode = 0
 	}
 	// Capture the output regardless of success or failure
-	result.TaskId = taskId
+	result.Id = taskId
 	result.Stdout = stdout.String()
 	result.Stderr = stderr.String()
 	result.Duration = time.Since(startTime)

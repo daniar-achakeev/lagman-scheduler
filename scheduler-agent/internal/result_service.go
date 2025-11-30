@@ -26,6 +26,7 @@ func NewResultReceiver(lgr Logger) *ResultReceiver {
 }
 
 func (r *ResultReceiver) Run(port int) error {
+	// TODO just playing with grpc
 	const addr = "127.0.0.1" // localhost
 	listener, err := net.Listen("tcp", net.JoinHostPort(addr, strconv.Itoa(port)))
 	if err != nil {
