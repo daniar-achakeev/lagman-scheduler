@@ -3,7 +3,27 @@ package internal
 import (
 	"context"
 	"fmt"
+	"iter"
+	"maps"
+	"sync"
+	"sync/atomic"
 	"time"
+)
+
+type ReturnCode int
+
+const (
+	NormalRC ReturnCode = iota //
+	ErrorRC
+)
+
+type TaskResultStatus int
+
+const (
+	Ready TaskResultStatus = iota // 0
+	Skipped
+	Canceled
+	Processed
 )
 
 //Simple data model:
@@ -13,11 +33,7 @@ import (
 // Result: job, task, run generic struct to store runs task and job results
 // Schedule/Trigger: manual, GraphAsTask, time, loop/chain with offset, ... job could here I need to think
 
-// RunConfig is used to pass job run configuration
-// each scheduled or manual job triggered run can be then
-// associated with the run
-// one job graph can have 1 to N runs
-// TODO this would be extedend
+// RunConfig is used to pass job run configuration TODO
 type RunConfig struct {
 	Id string
 }
@@ -28,6 +44,9 @@ type JobResult struct {
 	ReturnCode int
 	Err        error
 	Results    []Result
+	StartAt    time.Time
+	FinishedAt time.Time
+	Canceled   bool
 }
 
 // Task Result
@@ -39,103 +58,160 @@ type Result struct {
 	FinishedAt time.Time
 	Stdout     string
 	Stderr     string
-}
-
-// TaskIdSet
-type TaskIdSet map[string]struct{}
-
-func NewTaskIdSet() TaskIdSet {
-	return make(TaskIdSet)
-}
-
-func FromTaskIdMap(inTaskMap map[string]bool) TaskIdSet {
-	set := NewTaskIdSet()
-	for k := range inTaskMap {
-		set.Add(k)
-	}
-	return set
-}
-
-func (s TaskIdSet) Add(element string) {
-	s[element] = struct{}{}
-}
-
-func (s TaskIdSet) Contains(element string) bool {
-	_, exists := s[element]
-	return exists
-}
-
-func (s TaskIdSet) Remove(element string) {
-	delete(s, element)
+	Status     TaskResultStatus
 }
 
 // Task internal DAG processing unit uses channel to reflect dependency results
 type Task struct {
 	id         string
-	InBox      chan Result
 	childNodes []*Task
 	runnable   Runnable
-	inTaskMap  map[string]bool // this is a map that for each Id has bool value
-	// if true than checkResults function treats this on success to proceed
-	// if false than checkResults function treats this on failure to proceed
-	expectedIds TaskIdSet
+	inTaskMap  map[string]bool // this is a map that for each Id has bool value bool onSuccess or not
+	// processing fields
+	inBoxCh chan Result
+	started atomic.Bool // flag if go routine is already started
 }
 
+// Basic Factory
 func NewTask(id string, runnable Runnable) *Task {
 	return &Task{
-		id:          id,
-		InBox:       make(chan Result),
-		childNodes:  make([]*Task, 0),
-		runnable:    runnable,
-		inTaskMap:   make(map[string]bool),
-		expectedIds: NewTaskIdSet(),
+		id:         id,
+		childNodes: make([]*Task, 0),
+		runnable:   runnable,
+		inTaskMap:  make(map[string]bool),
+		inBoxCh:    make(chan Result),
 	}
 }
 
-func (t *Task) AddChild(task *Task) {
-	t.childNodes = append(t.childNodes, task)
+// Copies all fields, except childNodes, copies the pointer slice of pointers
+func FromTask(task *Task) *Task {
+	inmap := make(map[string]bool, len(task.inTaskMap))
+	maps.Copy(inmap, task.inTaskMap)
+	return &Task{
+		id:         task.id,
+		runnable:   task.runnable, // copy
+		inTaskMap:  inmap,
+		inBoxCh:    make(chan Result),
+		childNodes: task.childNodes, // pointer copy
+	}
 }
 
+// returns position of the child
+func (t *Task) childIdx(task *Task) int {
+	i := -1
+	for idx, c := range t.childNodes {
+		if c.id == task.id {
+			i = idx
+			break
+		}
+	}
+	return i
+}
+
+func (t *Task) AddChild(task *Task) {
+	// add child only if not exists
+	if t.childIdx(task) < 0 {
+		t.childNodes = append(t.childNodes, task)
+	}
+
+}
+
+// Remove child
+func (t *Task) RemoveChild(task *Task) {
+	if task != nil {
+		i := t.childIdx(task)
+		l := len(t.childNodes)
+		if i >= 0 {
+			// overwrite with last kinf of swap
+			t.childNodes[i] = t.childNodes[l-1]
+			t.childNodes[l-1] = nil // empty task
+			// NOTE: do not care about memory of nil pointer numbre of child nodes are not expceted to be high
+			t.childNodes = t.childNodes[:l-1]
+		}
+	}
+}
+
+// add dependecy
 func (t *Task) AddDependency(taskId string, proceedOnSuccess bool) {
-	t.expectedIds.Add(taskId)
 	t.inTaskMap[taskId] = proceedOnSuccess
 }
 
-// TODO
-// do we really need a errorChan maye be just wrapp result as non proceedError type
-func (t *Task) Process(ctx context.Context, errorChan chan<- error, resultChan chan<- Result) {
-	go func() {
-		defer close(t.InBox)
-		results := make([]Result, 0, len(t.expectedIds))
-	forLoop:
-		for len(t.expectedIds) > 0 {
-			// blocks until
-			select {
-			case res := <-t.InBox:
-				// check if alle results returned
-				results = append(results, res)
-				t.expectedIds.Remove(res.Id)
-			case <-ctx.Done():
-				break forLoop
+// removes dep.
+func (t *Task) RemoveDependency(task *Task) {
+	if task != nil {
+		delete(t.inTaskMap, task.id)
+	}
+}
+
+// IsRoot if no dependecies exists
+func (t *Task) IsRoot() bool {
+	return len(t.inTaskMap) == 0
+}
+
+// Process: creates a goroutine for runnable execution, on
+func (t *Task) Process(ctx context.Context, resultChan chan<- Result) {
+	// Process starts the go routine and after it finishes
+	// start dependet process
+	if t.started.CompareAndSwap(false, true) {
+		go func() {
+			// note do not close the channel they will be GCd
+			expectedIds := FromStringBoolMap(t.inTaskMap) // local to execution
+			results := make([]Result, 0, len(expectedIds))
+			runResult := Result{
+				Id:         t.id,
+				ReturnCode: 0,
 			}
-		}
-		canProceed := t.checkResults(results)
-		if canProceed {
-			runResult := t.runnable.Run(ctx, t.id)
-			resultChan <- runResult // used by job go routine to e.g. persist results
-			for _, child := range t.childNodes {
-				ch := child.InBox
-				ch <- runResult
+			canceled := false
+		forloop:
+			for len(expectedIds) > 0 {
+				// blocks until
+				select {
+				case res, ok := <-t.inBoxCh:
+					if !ok {
+						t.inBoxCh = nil
+						continue
+					}
+					// check if alle results returned
+					results = append(results, res)
+					expectedIds.Remove(res.Id)
+				case <-ctx.Done():
+					canceled = true
+					runResult.Status = Canceled
+					break forloop // break early from the loop
+				}
 			}
-		} else {
-			errorChan <- fmt.Errorf("ends with error %v", results)
-		}
-	}()
+			if !canceled {
+				if t.checkResults(results) {
+					runResult = t.runnable.Run(ctx, t.id) // this can be cancelled
+					runResult.Status = Processed
+				} else {
+					runResult.Status = Skipped
+				}
+			}
+			// write to channel we guarantee to return a result
+			resultChan <- runResult
+			// check children
+			for _, cRun := range t.childNodes {
+				// start lazy traverse the graph, nodes has an atomic bool if already visited started
+				cRun.Process(ctx, resultChan)
+				// child can be canceled
+				// should not be a problem we GC no inbox are closed
+				cRun.inBoxCh <- runResult
+			}
+		}()
+	} else {
+		// TODO impelement log logic
+		fmt.Println("task alerady started")
+	}
+
 }
 
 func (t *Task) checkResults(results []Result) bool {
 	proceed := true
 	for _, r := range results {
+		if r.Status == Canceled || r.Status == Skipped {
+			return false
+		}
 		proceedOnSuccess := t.inTaskMap[r.Id]
 		if proceedOnSuccess && (r.ReturnCode != 0 || r.Err != nil) {
 			return false
@@ -147,180 +223,203 @@ func (t *Task) checkResults(results []Result) bool {
 	return proceed
 }
 
-type InEdge struct {
-	proceedOnSuceess bool
-	sinkId           string
-}
-
 // JobGraph  is a DAG of tasks to be executed.
 // It supports adding tasks and dependencies, building the graph to ensure no cycles exist, and processing the tasks in order.
-// TODO: pass a DB Interface to store the task results
-// TODO: Add delete task method
+// Holds mutex, provides snapshot function for the execution
 type JobGraph struct {
-	id       string
-	nodes    map[string]*Task
-	inEdges  map[string][]InEdge
-	outEdges map[string][]string
-	tasks    []*Task
-	isReady  bool
+	id     string
+	nodes  map[string]*Task
+	cancel func()       // broadcast cancel from
+	rwMux  sync.RWMutex // mutex
 }
 
 func NewJobGraph(id string) *JobGraph {
 	return &JobGraph{
-		id:       id,
-		nodes:    map[string]*Task{},
-		outEdges: map[string][]string{}, // from source to list of sinks
-		inEdges:  map[string][]InEdge{}, // reverse edges needed for dependecies
-		tasks:    make([]*Task, 0),
-		isReady:  false,
+		id:     id,
+		nodes:  map[string]*Task{},
+		cancel: nil,
 	}
 }
 
 // Add Create new Task
 func (j *JobGraph) Add(taskId string, runnable Runnable) {
+	j.rwMux.Lock()
+	defer j.rwMux.Unlock()
 	j.nodes[taskId] = NewTask(taskId, runnable)
 }
 
 // AddDependency creates egde (task dependecy from source -> sink)
+// returns errors:
+// if either if source or sink not eixsts
+// if we build a cycle in DAG
+// cycle check is done via DFS from sink to source
 func (j *JobGraph) AddDependency(sourceId string, sinkId string, proceedOnSuccess bool) error {
+	j.rwMux.Lock()
+	defer j.rwMux.Unlock()
 	if _, ok := j.nodes[sourceId]; !ok {
 		return fmt.Errorf("sourceId %s not found", sourceId)
 	}
 	if _, ok := j.nodes[sinkId]; !ok {
 		return fmt.Errorf("sinkId %s not found", sinkId)
 	}
-	_, ok := j.inEdges[sinkId]
-	if !ok {
-		j.inEdges[sinkId] = make([]InEdge, 0)
-	}
-	j.inEdges[sinkId] = append(j.inEdges[sinkId], InEdge{sinkId: sourceId, proceedOnSuceess: proceedOnSuccess})
-	_, ok = j.outEdges[sourceId]
-	if !ok {
-		j.outEdges[sourceId] = make([]string, 0)
-	}
-	j.outEdges[sourceId] = append(j.outEdges[sourceId], sinkId)
 	// update task defs
 	sourceTask := j.nodes[sourceId]
 	sinkTask := j.nodes[sinkId]
+	// add edge from source to sink
 	sourceTask.AddChild(sinkTask)
+	// now check backwards if DAG still holds
+	if dagOk := CheckDfsDagNodes(sinkTask, sourceTask); dagOk {
+		sourceTask.RemoveChild(sinkTask)
+		return fmt.Errorf("Cannot add dependecy, creates cycle, %s, %s", sourceTask.id, sinkTask.id)
+	}
 	sinkTask.AddDependency(sourceTask.id, proceedOnSuccess)
+	// check
 	return nil
 }
 
-func (j *JobGraph) BuildGraph() error {
-	tOrderedNodes := make([]string, 0, len(j.nodes))
-	// copy the graph
-	graphOutCopy := map[string]map[string]struct{}{}
-	graphInCopy := map[string]map[string]struct{}{}
-	for k, v := range j.outEdges {
-		m := map[string]struct{}{}
-		for _, n := range v {
-			m[n] = struct{}{}
+// Removes Task and all its edges
+func (j *JobGraph) RemoveTask(taskId string) {
+	j.rwMux.Lock()
+	defer j.rwMux.Unlock()
+	if s, ok := j.nodes[taskId]; ok {
+		// currently full search
+		for id, node := range j.nodes {
+			if id == s.id {
+				continue
+			}
+			node.RemoveChild(s)
+			node.RemoveDependency(s)
 		}
-		graphOutCopy[k] = m
+		delete(j.nodes, taskId)
 	}
-	for k, v := range j.inEdges {
-		m := map[string]struct{}{}
-		for _, n := range v {
-			m[n.sinkId] = struct{}{}
+}
+
+// Removes edge between DAG node Tasks
+func (j *JobGraph) RemoveDependency(sourceId string, sinkId string) {
+	j.rwMux.Lock()
+	defer j.rwMux.Unlock()
+	s, sok := j.nodes[sourceId]
+	si, siok := j.nodes[sinkId]
+	if sok {
+		s.RemoveChild(si)
+	}
+	if siok {
+		si.RemoveDependency(s)
+	}
+}
+
+// Snapshot the graph for execution
+func (j *JobGraph) Snaphot() map[string]*Task {
+	j.rwMux.RLock()         //
+	defer j.rwMux.RUnlock() // release
+	// copy
+	cNodes := make(map[string]*Task, len(j.nodes))
+	for key, refTask := range j.nodes {
+		// can it happen that I will receive a nil ref?
+		if refTask == nil {
+			continue
 		}
-		graphInCopy[k] = m
+		cNodes[key] = FromTask(refTask) // store ref
 	}
-	// find roots
-	roots := j.getRoots()
-	for len(roots) > 0 {
-		for c := range roots {
-			// remove from roots reflected after loop end
-			delete(roots, c)
-			tOrderedNodes = append(tOrderedNodes, c)
-			// expand
-			childNodes, ok := graphOutCopy[c]
-			if ok {
-				delete(graphOutCopy, c)
-				for ch := range childNodes {
-					// remove reverse edge too
-					delete(graphInCopy[ch], c)
-					inEdges, ok := graphInCopy[ch]
-					if ok && len(inEdges) == 0 { // no in egdes
-						delete(graphInCopy, ch)
-						roots[ch] = struct{}{}
-					}
+	// now copy create new child nodes
+	for _, cNode := range cNodes {
+		cChilds := make([]*Task, 0, len(cNode.childNodes))
+		for _, c := range cNode.childNodes { // from the copy
+			if node, ok := cNodes[c.id]; ok {
+				cChilds = append(cChilds, node)
+			}
+		}
+		cNode.childNodes = cChilds
+	}
+	return cNodes
+}
+
+// --- Graph Executions ---
+
+// JobGraphRun: is an instance of running the JobGraph defintion
+type JobGraphRun struct {
+	nodes   map[string]*Task
+	graphId string
+	config  RunConfig
+	cancel  func() // broadcast cancel
+}
+
+// Factory fucntion
+// the copy of job graph struct
+func NewJobGraphRun(config RunConfig, graphId string, nodes map[string]*Task) *JobGraphRun {
+	return &JobGraphRun{
+		config:  config,
+		nodes:   nodes,
+		graphId: graphId,
+	}
+}
+
+// Graph job runner: runs on a current snapshot/copy of the graph
+// any changes to a main graph after the run are not reflected
+func (j *JobGraphRun) Run(parentCtx context.Context, jobResultChan chan<- JobResult) error {
+	go func() {
+		startAt := time.Now() // wall clock
+		jCtx, cancel := context.WithCancel(parentCtx)
+		j.cancel = cancel
+		taskResChan := make(chan Result, len(j.nodes))
+		defer close(taskResChan)
+		defer cancel()
+		expectedResultIds := make(map[string]struct{})
+		for id := range j.nodes {
+			expectedResultIds[id] = struct{}{}
+		}
+		result := make([]Result, 0, len(j.nodes))
+		// start
+		for t := range j.getRoots() {
+			t.Process(jCtx, taskResChan)
+		}
+		// receive
+		var tErrCantProceed error
+		var canceled bool
+		returnCode := NormalRC
+		// dfg traverse return results
+		for len(expectedResultIds) > 0 {
+			select {
+			case res, ok := <-taskResChan: // fetch task results
+				if !ok {
+					continue
+				}
+				delete(expectedResultIds, res.Id)
+				result = append(result, res)
+			case <-jCtx.Done():
+				canceled = true
+			}
+		}
+		jobResultChan <- JobResult{
+			JobId:      j.graphId,
+			Err:        tErrCantProceed,
+			ReturnCode: int(returnCode),
+			Results:    result,
+			StartAt:    startAt,
+			FinishedAt: time.Now(),
+			Canceled:   canceled,
+		}
+	}()
+	return nil
+}
+
+func (j *JobGraphRun) Cancel() error {
+	if j.cancel != nil {
+		j.cancel()
+		return nil
+	}
+	return fmt.Errorf("Graph is not ready and context is not set")
+}
+
+// internal function
+func (j *JobGraphRun) getRoots() iter.Seq[*Task] {
+	return func(yield func(*Task) bool) {
+		for _, t := range j.nodes {
+			if t.IsRoot() {
+				if !yield(t) {
+					return
 				}
 			}
 		}
 	}
-	if len(graphOutCopy) > 0 {
-		// TODO Logging and description the nodes in graph
-		return fmt.Errorf("graph has at least one cycle")
-	}
-	//
-	for _, n := range tOrderedNodes {
-		j.tasks = append(j.tasks, j.nodes[n])
-	}
-	j.isReady = true
-	return nil
-}
-
-func (j *JobGraph) getRoots() map[string]struct{} {
-	roots := map[string]struct{}{}
-	for c := range j.nodes {
-		if _, ok := j.inEdges[c]; !ok {
-			roots[c] = struct{}{}
-		}
-	}
-	return roots
-}
-
-// Process is a main go routine for a job
-// TODO: config management
-// number of errors ,...
-// persistence layer
-// pass run config
-func (j *JobGraph) Run(ctx context.Context, runConfig RunConfig, jobErrorChan chan<- error, jobResultChan chan<- JobResult) error {
-	// build tasks
-	if !j.isReady {
-		return fmt.Errorf("Run build function graph is not ready")
-	}
-	go func() {
-		taskErrChan := make(chan error)
-		taskResChan := make(chan Result, len(j.tasks))
-		defer close(taskErrChan)
-		defer close(taskResChan)
-		expectedResultIds := make(map[string]struct{})
-		for _, t := range j.tasks {
-			expectedResultIds[t.id] = struct{}{}
-		}
-		result := make([]Result, 0, len(j.tasks))
-		// start
-		for _, t := range j.tasks {
-			t.Process(ctx, taskErrChan, taskResChan)
-		}
-		// receive
-		var tErrCantProceed error
-	forloop:
-		for len(expectedResultIds) > 0 {
-			select {
-			case res := <-taskResChan:
-				delete(expectedResultIds, res.Id)
-				result = append(result, res)
-			case tErrCantProceed = <-taskErrChan:
-				// non proceed task error
-				jobErrorChan <- tErrCantProceed
-				break forloop
-			}
-		}
-		// all tasks
-		// TODO: persist result here (  is it a right place or should we persist on receive?)
-		returnCode := 0
-		if tErrCantProceed != nil {
-			returnCode = 1
-		}
-		jobResultChan <- JobResult{
-			JobId:      j.id,
-			Err:        tErrCantProceed,
-			ReturnCode: returnCode,
-			Results:    result,
-		}
-	}()
-	return nil
 }
